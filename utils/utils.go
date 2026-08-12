@@ -6,6 +6,7 @@ import (
     "fmt"
     "html"
     "log"
+    "net"
     "net/http"
     "runtime"
     "strings"
@@ -104,21 +105,22 @@ func Shutdown() {
     log.Println("Shutdown complete.")
 }
 
-func parseLogEntryFast(line string) (ip, username string, valid bool) {
+// Updated to return ip, port, username, valid
+func parseLogEntryFast(line string) (ip, port, username string, valid bool) {
     lineBytes := []byte(line)
 
     if !bytes.Contains(lineBytes, torrentTagBytes) {
-        return "", "", false
+        return "", "", "", false
     }
 
     fromIndex := bytes.Index(lineBytes, fromBytes)
     if fromIndex == -1 {
-        return "", "", false
+        return "", "", "", false
     }
 
     ipStart := fromIndex + len(fromBytes)
     if ipStart >= len(line) {
-        return "", "", false
+        return "", "", "", false
     }
 
     if ipStart+4 < len(line) {
@@ -129,7 +131,7 @@ func parseLogEntryFast(line string) (ip, username string, valid bool) {
     }
 
     if ipStart >= len(line) {
-        return "", "", false
+        return "", "", "", false
     }
 
     ipEnd := ipStart
@@ -138,23 +140,40 @@ func parseLogEntryFast(line string) (ip, username string, valid bool) {
     }
 
     if ipEnd <= ipStart {
-        return "", "", false
+        return "", "", "", false
     }
 
     ip = line[ipStart:ipEnd]
 
+    // Extract destination port (the torrent port)
+    if ipEnd < len(line) && line[ipEnd] == ':' {
+        portStart := ipEnd + 1
+        portEnd := portStart
+        for portEnd < len(line) && line[portEnd] != ' ' && line[portEnd] != '\t' && line[portEnd] != '\n' {
+            portEnd++
+        }
+        if portEnd > portStart {
+            port = line[portStart:portEnd]
+        }
+    }
+
     if !isValidIPFormat(ip) {
-        return "", "", false
+        return "", "", "", false
+    }
+
+    // Handle IgnoreEmail setting (TPROXY support)
+    if config.IgnoreEmail {
+        return ip, port, "unknown", true
     }
 
     emailIndex := bytes.Index(lineBytes, emailBytes)
     if emailIndex == -1 {
-        return "", "", false
+        return "", "", "", false
     }
 
     userStart := emailIndex + len(emailBytes)
     if userStart >= len(line) {
-        return "", "", false
+        return "", "", "", false
     }
 
     userEnd := userStart
@@ -163,15 +182,15 @@ func parseLogEntryFast(line string) (ip, username string, valid bool) {
     }
 
     if userEnd <= userStart {
-        return "", "", false
+        return "", "", "", false
     }
 
     username = line[userStart:userEnd]
-    return ip, username, true
+    return ip, port, username, true
 }
 
 func handleLogEntry(line string) {
-    ip, usernameStr, valid := parseLogEntryFast(line)
+    ip, port, usernameStr, valid := parseLogEntryFast(line)
 
     if !valid {
         log.Println("Invalid log entry format: IP or username missing")
@@ -192,7 +211,7 @@ func handleLogEntry(line string) {
     }
 
     go BlockIP(ip)
-    log.Printf("User %s with IP: %s blocked for %d minutes\n", usernameStr, ip, config.BlockDuration)
+    log.Printf("User %s with IP: %s:%s blocked for %d minutes\n", usernameStr, ip, port, config.BlockDuration)
 
     if config.SendWebhook {
         go SendWebhook(usernameStr, ip, "block")
@@ -308,25 +327,9 @@ func IsBypassedIP(ip string) bool {
     return exists
 }
 
+// Updated to use net.ParseIP for native IPv4 and IPv6 support
 func isValidIPFormat(ip string) bool {
-    parts := strings.Split(ip, ".")
-    if len(parts) != 4 {
-        return false
-    }
-
-    for _, part := range parts {
-        if len(part) == 0 || len(part) > 3 {
-            return false
-        }
-
-        for _, ch := range part {
-            if ch < '0' || ch > '9' {
-                return false
-            }
-        }
-    }
-
-    return true
+    return net.ParseIP(ip) != nil
 }
 
 // WebhookPayload defines the structure for safe JSON encoding (fallback)

@@ -213,6 +213,9 @@ func handleLogEntry(line string) {
     go BlockIP(ip)
     log.Printf("User %s with IP: %s:%s blocked for %d minutes\n", usernameStr, ip, port, config.BlockDuration)
 
+    // Phase 4: Record strike for repeat offender tracking
+    RecordStrike(usernameStr, port)
+
     if config.SendWebhook {
         go SendWebhook(usernameStr, ip, "block")
     }

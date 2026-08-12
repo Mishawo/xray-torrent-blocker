@@ -1,0 +1,5 @@
+LogFile: "/var/log/remnanode/access.log"
+BlockDuration: 10
+TorrentTag: "TORRENT"
+BlockMode: "iptables"
+

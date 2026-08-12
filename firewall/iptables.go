@@ -1,256 +1,297 @@
 package firewall
 
 import (
-	"fmt"
-	"log"
-	"regexp"
-	"strings"
-	"sync"
+    "fmt"
+    "log"
+    "net"
+    "strings"
+    "sync"
 
-	"github.com/coreos/go-iptables/iptables"
+    "github.com/coreos/go-iptables/iptables"
 )
 
 type IPTablesFirewall struct {
-	mu          sync.Mutex // Added for thread safety
-	ipRegex     *regexp.Regexp
-	ipt         *iptables.IPTables
-	chainName   string
-	initialized bool
+    mu          sync.Mutex
+    ipt         *iptables.IPTables // IPv4
+    ip6t        *iptables.IPTables // IPv6
+    chainName   string
+    initialized bool
 }
 
 func NewIPTablesFirewall() *IPTablesFirewall {
-	ipt, err := iptables.New()
-	if err != nil {
-		log.Printf("Error creating iptables instance: %v", err)
-		return &IPTablesFirewall{
-			ipRegex:     regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+)`),
-			ipt:         nil,
-			chainName:   "TBLOCKER_BLOCKED",
-			initialized: false,
-		}
-	}
+    ipt, err4 := iptables.New()
+    if err4 != nil {
+        log.Printf("Warning: could not create iptables instance: %v", err4)
+        ipt = nil
+    }
 
-	return &IPTablesFirewall{
-		ipRegex:     regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+)`),
-		ipt:         ipt,
-		chainName:   "TBLOCKER_BLOCKED",
-		initialized: false,
-	}
+    ip6t, err6 := iptables.NewWithProtocol(iptables.ProtocolIPv6)
+    if err6 != nil {
+        log.Printf("Warning: could not create ip6tables instance: %v", err6)
+        ip6t = nil
+    }
+
+    return &IPTablesFirewall{
+        ipt:         ipt,
+        ip6t:        ip6t,
+        chainName:   "TBLOCKER_BLOCKED",
+        initialized: false,
+    }
 }
 
 func (f *IPTablesFirewall) Initialize() error {
-	if f.initialized {
-		return nil
-	}
+    if f.initialized {
+        return nil
+    }
 
-	if f.ipt == nil {
-		return fmt.Errorf("iptables not available")
-	}
+    if f.ipt == nil && f.ip6t == nil {
+        return fmt.Errorf("no iptables/ip6tables available")
+    }
 
-	_, err := f.ipt.List("raw", "PREROUTING")
-	if err != nil {
-		log.Printf("IPTables is not available on this system: %v", err)
-		return fmt.Errorf("iptables not available: %v", err)
-	}
+    log.Printf("Initializing iptables firewall...")
 
-	log.Printf("Initializing iptables firewall...")
+    if f.ipt != nil {
+        if err := f.initializeProtocol(f.ipt); err != nil {
+            log.Printf("Error initializing iptables (IPv4): %v", err)
+        }
+    }
 
-	exists, err := f.ipt.ChainExists("raw", f.chainName)
-	if err != nil {
-		log.Printf("Error checking chain existence: %v", err)
-		return err
-	}
+    if f.ip6t != nil {
+        if err := f.initializeProtocol(f.ip6t); err != nil {
+            log.Printf("Error initializing ip6tables (IPv6): %v", err)
+        }
+    }
 
-	if !exists {
-		err = f.ipt.NewChain("raw", f.chainName)
-		if err != nil {
-			log.Printf("Error creating chain %s: %v", f.chainName, err)
-			return err
-		}
-		log.Printf("Created chain %s in raw table", f.chainName)
-	}
+    f.initialized = true
+    log.Printf("IPTables firewall initialized successfully with custom chain %s", f.chainName)
+    return nil
+}
 
-	rules, err := f.ipt.List("raw", "PREROUTING")
-	if err != nil {
-		log.Printf("Error listing PREROUTING rules: %v", err)
-		return err
-	}
+// initializeProtocol handles the chain creation and jump rule for a specific IP protocol
+func (f *IPTablesFirewall) initializeProtocol(ipt *iptables.IPTables) error {
+    _, err := ipt.List("raw", "PREROUTING")
+    if err != nil {
+        return fmt.Errorf("not available: %v", err)
+    }
 
-	jumpRuleExists := false
-	for _, rule := range rules {
-		if strings.Contains(rule, f.chainName) {
-			jumpRuleExists = true
-			break
-		}
-	}
+    exists, err := ipt.ChainExists("raw", f.chainName)
+    if err != nil {
+        return err
+    }
 
-	if !jumpRuleExists {
-		err = f.ipt.Insert("raw", "PREROUTING", 1, "-j", f.chainName)
-		if err != nil {
-			log.Printf("Error adding jump rule to %s: %v", f.chainName, err)
-			return err
-		}
-		log.Printf("Added jump rule to %s in PREROUTING chain", f.chainName)
-	}
+    if !exists {
+        err = ipt.NewChain("raw", f.chainName)
+        if err != nil {
+            return err
+        }
+        log.Printf("Created chain %s in raw table", f.chainName)
+    }
 
-	f.initialized = true
-	log.Printf("IPTables firewall initialized successfully with custom chain %s", f.chainName)
-	return nil
+    rules, err := ipt.List("raw", "PREROUTING")
+    if err != nil {
+        return err
+    }
+
+    jumpRuleExists := false
+    for _, rule := range rules {
+        if strings.Contains(rule, f.chainName) {
+            jumpRuleExists = true
+            break
+        }
+    }
+
+    if !jumpRuleExists {
+        err = ipt.Insert("raw", "PREROUTING", 1, "-j", f.chainName)
+        if err != nil {
+            return err
+        }
+        log.Printf("Added jump rule to %s in PREROUTING chain", f.chainName)
+    }
+
+    return nil
 }
 
 // ensureInitialized safely handles the mutex locking for initialization
 func (f *IPTablesFirewall) ensureInitialized() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if !f.initialized {
-		return f.Initialize()
-	}
-	return nil
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    if !f.initialized {
+        return f.Initialize()
+    }
+    return nil
+}
+
+// getIPTablesInstance returns the correct firewall instance based on IP type
+func (f *IPTablesFirewall) getIPTablesInstance(ip string) (*iptables.IPTables, error) {
+    if err := f.ensureInitialized(); err != nil {
+        return nil, err
+    }
+
+    parsedIP := net.ParseIP(ip)
+    if parsedIP == nil {
+        return nil, fmt.Errorf("invalid IP address: %s", ip)
+    }
+
+    if parsedIP.To4() != nil {
+        if f.ipt == nil {
+            return nil, fmt.Errorf("iptables (IPv4) not available")
+        }
+        return f.ipt, nil
+    }
+
+    if f.ip6t == nil {
+        return nil, fmt.Errorf("ip6tables (IPv6) not available")
+    }
+    return f.ip6t, nil
 }
 
 func (f *IPTablesFirewall) BlockIP(ip string) error {
-	if f.ipt == nil {
-		return fmt.Errorf("iptables not available")
-	}
+    ipt, err := f.getIPTablesInstance(ip)
+    if err != nil {
+        return err
+    }
 
-	if err := f.ensureInitialized(); err != nil {
-		return err
-	}
+    rules, err := ipt.List("raw", f.chainName)
+    if err != nil {
+        return err
+    }
 
-	rules, err := f.ipt.List("raw", f.chainName)
-	if err != nil {
-		log.Printf("Error getting rules from chain %s: %v", f.chainName, err)
-		return err
-	}
+    for _, rule := range rules {
+        if strings.Contains(rule, ip) && strings.Contains(rule, "DROP") {
+            log.Printf("IP %s is already blocked in chain %s", ip, f.chainName)
+            return nil
+        }
+    }
 
-	for _, rule := range rules {
-		if strings.Contains(rule, ip) && strings.Contains(rule, "DROP") {
-			log.Printf("IP %s is already blocked in chain %s", ip, f.chainName)
-			return nil
-		}
-	}
+    err = ipt.Append("raw", f.chainName, "-s", ip, "-j", "DROP")
+    if err != nil {
+        log.Printf("Error blocking IP %s in chain %s: %v", ip, f.chainName, err)
+        return err
+    }
 
-	err = f.ipt.Append("raw", f.chainName, "-s", ip, "-j", "DROP")
-	if err != nil {
-		log.Printf("Error blocking IP %s in chain %s: %v", ip, f.chainName, err)
-		return err
-	}
-
-	log.Printf("IP %s blocked in chain %s", ip, f.chainName)
-	return nil
+    log.Printf("IP %s blocked in chain %s", ip, f.chainName)
+    return nil
 }
 
 func (f *IPTablesFirewall) UnblockIP(ip string) error {
-	if f.ipt == nil {
-		return fmt.Errorf("iptables not available")
-	}
+    ipt, err := f.getIPTablesInstance(ip)
+    if err != nil {
+        return err
+    }
 
-	if err := f.ensureInitialized(); err != nil {
-		return err
-	}
+    err = ipt.Delete("raw", f.chainName, "-s", ip, "-j", "DROP")
+    if err != nil {
+        log.Printf("Error unblocking IP %s from chain %s: %v", ip, f.chainName, err)
+        return err
+    }
 
-	err := f.ipt.Delete("raw", f.chainName, "-s", ip, "-j", "DROP")
-	if err != nil {
-		log.Printf("Error unblocking IP %s from chain %s: %v", ip, f.chainName, err)
-		return err
-	}
-
-	log.Printf("IP %s unblocked from chain %s", ip, f.chainName)
-	return nil
+    log.Printf("IP %s unblocked from chain %s", ip, f.chainName)
+    return nil
 }
 
 func (f *IPTablesFirewall) GetBlockedIPs() (map[string]bool, error) {
-	if f.ipt == nil {
-		return nil, fmt.Errorf("iptables not available")
-	}
+    if err := f.ensureInitialized(); err != nil {
+        return nil, err
+    }
 
-	if err := f.ensureInitialized(); err != nil {
-		return nil, err
-	}
+    blockedIPs := make(map[string]bool)
 
-	rules, err := f.ipt.List("raw", f.chainName)
-	if err != nil {
-		log.Printf("Error getting rules from chain %s: %v", f.chainName, err)
-		return nil, err
-	}
+    // Parse IPv4 rules
+    if f.ipt != nil {
+        rules, err := f.ipt.List("raw", f.chainName)
+        if err == nil {
+            for _, rule := range rules {
+                if strings.Contains(rule, "DROP") {
+                    // Safely extract IP from the -s flag
+                    parts := strings.Fields(rule)
+                    for i, part := range parts {
+                        if part == "-s" && i+1 < len(parts) {
+                            blockedIPs[parts[i+1]] = true
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-	blockedIPs := make(map[string]bool)
+    // Parse IPv6 rules
+    if f.ip6t != nil {
+        rules, err := f.ip6t.List("raw", f.chainName)
+        if err == nil {
+            for _, rule := range rules {
+                if strings.Contains(rule, "DROP") {
+                    parts := strings.Fields(rule)
+                    for i, part := range parts {
+                        if part == "-s" && i+1 < len(parts) {
+                            blockedIPs[parts[i+1]] = true
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-	for _, rule := range rules {
-		if strings.Contains(rule, "DROP") {
-			ip := f.ipRegex.FindString(rule)
-			if ip != "" && ip != "0.0.0.0" {
-				blockedIPs[ip] = true
-			}
-		}
-	}
-
-	return blockedIPs, nil
+    return blockedIPs, nil
 }
 
 func (f *IPTablesFirewall) IsAvailable() bool {
-	if f.ipt == nil {
-		return false
-	}
+    if f.ipt == nil && f.ip6t == nil {
+        return false
+    }
 
-	_, err := f.ipt.List("raw", "PREROUTING")
-	return err == nil
+    if f.ipt != nil {
+        if _, err := f.ipt.List("raw", "PREROUTING"); err == nil {
+            return true
+        }
+    }
+
+    if f.ip6t != nil {
+        if _, err := f.ip6t.List("raw", "PREROUTING"); err == nil {
+            return true
+        }
+    }
+
+    return false
 }
 
 func (f *IPTablesFirewall) GetName() string {
-	return "iptables"
+    return "iptables"
 }
 
 func (f *IPTablesFirewall) FlushChain() error {
-	if f.ipt == nil {
-		return fmt.Errorf("iptables not available")
-	}
-
-	if !f.initialized {
-		return nil
-	}
-
-	err := f.ipt.ClearChain("raw", f.chainName)
-	if err != nil {
-		log.Printf("Error flushing chain %s: %v", f.chainName, err)
-		return err
-	}
-
-	log.Printf("Chain %s flushed successfully", f.chainName)
-	return nil
+    if f.ipt != nil {
+        if err := f.ipt.ClearChain("raw", f.chainName); err != nil {
+            log.Printf("Error flushing IPv4 chain %s: %v", f.chainName, err)
+        }
+    }
+    if f.ip6t != nil {
+        if err := f.ip6t.ClearChain("raw", f.chainName); err != nil {
+            log.Printf("Error flushing IPv6 chain %s: %v", f.chainName, err)
+        }
+    }
+    log.Printf("Chain %s flushed successfully", f.chainName)
+    return nil
 }
 
 func (f *IPTablesFirewall) RemoveChain() error {
-	if f.ipt == nil {
-		return fmt.Errorf("iptables not available")
-	}
+    if f.ipt != nil {
+        f.ipt.Delete("raw", "PREROUTING", "-j", f.chainName)
+        f.ipt.ClearChain("raw", f.chainName)
+        f.ipt.DeleteChain("raw", f.chainName)
+    }
+    if f.ip6t != nil {
+        f.ip6t.Delete("raw", "PREROUTING", "-j", f.chainName)
+        f.ip6t.ClearChain("raw", f.chainName)
+        f.ip6t.DeleteChain("raw", f.chainName)
+    }
 
-	if !f.initialized {
-		return nil
-	}
-
-	err := f.ipt.Delete("raw", "PREROUTING", "-j", f.chainName)
-	if err != nil {
-		log.Printf("Warning: Could not remove jump rule to %s: %v", f.chainName, err)
-	}
-
-	err = f.ipt.ClearChain("raw", f.chainName)
-	if err != nil {
-		log.Printf("Error clearing chain %s: %v", f.chainName, err)
-		return err
-	}
-
-	err = f.ipt.DeleteChain("raw", f.chainName)
-	if err != nil {
-		log.Printf("Error deleting chain %s: %v", f.chainName, err)
-		return err
-	}
-
-	f.initialized = false
-	log.Printf("Chain %s removed successfully", f.chainName)
-	return nil
+    f.initialized = false
+    log.Printf("Chain %s removed successfully", f.chainName)
+    return nil
 }
 
 func (f *IPTablesFirewall) GetChainName() string {
-	return f.chainName
+    return f.chainName
 }

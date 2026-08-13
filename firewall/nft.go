@@ -4,6 +4,7 @@ import (
     "fmt"
     "log"
     "net"
+    "strings"
     "sync"
 
     "github.com/google/nftables"
@@ -171,6 +172,10 @@ func (f *NFTFirewall) BlockIP(ip string) error {
     f.conn.SetAddElements(set, []nftables.SetElement{element})
 
     if err := f.conn.Flush(); err != nil {
+        // If the IP is already in the set, nftables returns an "exists" error. We ignore it.
+        if strings.Contains(err.Error(), "exists") {
+            return nil
+        }
         log.Printf("Error adding IP %s to nftables set: %v", ip, err)
         return fmt.Errorf("failed to add IP %s to nftables set: %v", ip, err)
     }

@@ -46,15 +46,15 @@ INSTALL_FROM_PACKAGE=false
 if command -v apt-get &> /dev/null; then
     DISTRO="debian"
     PKG_MANAGER="apt-get"
-    INSTALL_FROM_PACKAGE=true
+    INSTALL_FROM_PACKAGE=false
 elif command -v yum &> /dev/null; then
     DISTRO="rhel"
     PKG_MANAGER="yum"
-    INSTALL_FROM_PACKAGE=true
+    INSTALL_FROM_PACKAGE=false
 elif command -v dnf &> /dev/null; then
     DISTRO="fedora"
     PKG_MANAGER="dnf"
-    INSTALL_FROM_PACKAGE=true
+    INSTALL_FROM_PACKAGE=false
 elif command -v pacman &> /dev/null; then
     DISTRO="arch"
     PKG_MANAGER="pacman"

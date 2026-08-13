@@ -261,18 +261,15 @@ func UpdateBlockedIPs() {
         return
     }
 
-    currentBlockedIPs, err := firewallManager.GetBlockedIPs()
-    if err != nil {
-        log.Printf("Error checking firewall status: %v", err)
-        return
-    }
-
     blockedInStorage := ipStorage.GetBlockedIPs()
 
     for ip, info := range blockedInStorage {
-        if time.Now().Before(info.BlockedUntil) && !currentBlockedIPs[ip] {
+        if time.Now().Before(info.BlockedUntil) {
             log.Printf("Restoring block for IP: %s (user: %s) using %s", ip, info.Username, firewallManager.GetFirewallName())
             go BlockIP(ip)
+        } else {
+            // Clean up expired blocks from storage on startup
+            ipStorage.RemoveBlockedIP(ip)
         }
     }
 }

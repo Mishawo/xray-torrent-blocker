@@ -5,6 +5,7 @@ import (
     "encoding/json"
     "fmt"
     "html"
+    "io"
     "log"
     "net"
     "net/http"
@@ -288,22 +289,12 @@ func ScheduleBlockedIPsUpdate() {
 func UnblockIPAfterDelay(ip string, delay time.Duration, username string) {
     time.Sleep(delay)
 
-    if ipStorage.IsBlocked(ip) {
-        log.Printf("Skipping unblock for IP %s as it has an active block", ip)
-        return
-    }
-
     if firewallManager == nil {
         log.Printf("Firewall manager not initialized")
         return
     }
 
-    blockedIPs := ipStorage.GetBlockedIPs()
-    if _, exists := blockedIPs[ip]; !exists {
-        log.Printf("IP %s not found in storage, skipping unblock", ip)
-        return
-    }
-
+    // Attempt to unblock from firewall directly
     err := firewallManager.UnblockIP(ip)
     if err != nil {
         if strings.Contains(err.Error(), "no rule found") || strings.Contains(err.Error(), "exit status 1") {
@@ -314,8 +305,9 @@ func UnblockIPAfterDelay(ip string, delay time.Duration, username string) {
         }
     }
 
+    // Clean up storage (it's okay if it was already cleaned up)
     if err := ipStorage.RemoveBlockedIP(ip); err != nil {
-        log.Printf("Error removing IP from storage: %v", err)
+        // Ignore error if it doesn't exist
     }
 
     log.Printf("User %s with IP: %s has been unblocked\n", username, ip)
@@ -409,7 +401,8 @@ func SendWebhook(username string, ip string, action string) {
     defer resp.Body.Close()
 
     if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-        log.Printf("Webhook returned unexpected status code: %d", resp.StatusCode)
+        body, _ := io.ReadAll(resp.Body)
+        log.Printf("Webhook returned unexpected status code: %d. Error: %s", resp.StatusCode, string(body))
     }
 }
 

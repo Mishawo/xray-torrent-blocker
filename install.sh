@@ -144,9 +144,10 @@ if [ "$INSTALL_FROM_PACKAGE" = false ]; then
         exit 1
     fi
     
-    print_info "Extracting files..."
+        print_info "Extracting files..."
     mkdir -p /opt/tblocker
     tar -xzf tblocker.tar.gz -C /opt/tblocker --overwrite
+    chmod 755 /opt/tblocker/tblocker  # <--- ADD THIS LINE
     rm tblocker.tar.gz
     
     INSTALL_DIR="/opt/tblocker"

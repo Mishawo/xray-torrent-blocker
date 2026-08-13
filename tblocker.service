@@ -1,6 +1,6 @@
 [Unit]
 Description=XRay Torrent Blocker Service
-Documentation=https://github.com/kutovoys/xray-torrent-blocker
+Documentation=https://github.com/Mishawo/xray-torrent-blocker
 After=network.target
 
 [Service]
@@ -8,6 +8,12 @@ Type=simple
 User=root
 ExecStart=/opt/tblocker/tblocker -c /opt/tblocker/config.yaml
 Restart=on-failure
+RestartSec=5
+
+# Security Hardening
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
 
 [Install]
-WantedBy=multi-user.target 
+WantedBy=multi-user.target

@@ -133,9 +133,9 @@ if [ "$INSTALL_FROM_PACKAGE" = false ]; then
             ;;
     esac
     
-    print_info "Downloading the latest version of tblocker..."
-    LATEST_RELEASE=$(curl -s https://api.github.com/repos/kutovoys/xray-torrent-blocker/releases/latest | grep tag_name | cut -d '"' -f 4)
-    URL="https://github.com/kutovoys/xray-torrent-blocker/releases/download/${LATEST_RELEASE}/xray-torrent-blocker-${LATEST_RELEASE}-linux-${ARCH}.tar.gz"
+        print_info "Downloading the latest version of tblocker..."
+    LATEST_RELEASE=$(curl -s https://api.github.com/repos/Mishawo/xray-torrent-blocker/releases/latest | grep tag_name | cut -d '"' -f 4)
+    URL="https://github.com/Mishawo/xray-torrent-blocker/releases/download/${LATEST_RELEASE}/xray-torrent-blocker-${LATEST_RELEASE}-linux-${ARCH}.tar.gz"
     
     curl -sL "$URL" -o tblocker.tar.gz
     
@@ -162,8 +162,8 @@ if [ "$INSTALL_FROM_PACKAGE" = false ]; then
         print_info "Configuration file already exists at $CONFIG_PATH"
     fi
     
-    print_info "Setting up systemd service..."
-    curl -sL https://raw.githubusercontent.com/kutovoys/xray-torrent-blocker/main/tblocker.service -o /etc/systemd/system/tblocker.service
+        print_info "Setting up systemd service..."
+    curl -sL https://raw.githubusercontent.com/Mishawo/xray-torrent-blocker/main/tblocker.service -o /etc/systemd/system/tblocker.service
 fi
 
 print_info "Configuration setup..."

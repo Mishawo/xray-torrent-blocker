@@ -156,6 +156,10 @@ func (f *NFTFirewall) BlockIP(ip string) error {
         return fmt.Errorf("failed to initialize firewall: %v", err)
     }
 
+    // LOCK HERE: Prevent multiple goroutines from flooding netlink at the same time
+    f.mu.Lock()
+    defer f.mu.Unlock()
+
     table := &nftables.Table{Family: nftables.TableFamilyINet, Name: "tblocker"}
     var set *nftables.Set
     var keyBytes []byte
@@ -172,7 +176,6 @@ func (f *NFTFirewall) BlockIP(ip string) error {
     f.conn.SetAddElements(set, []nftables.SetElement{element})
 
     if err := f.conn.Flush(); err != nil {
-        // If the IP is already in the set, nftables returns an "exists" error. We ignore it.
         if strings.Contains(err.Error(), "exists") {
             return nil
         }
@@ -193,6 +196,10 @@ func (f *NFTFirewall) UnblockIP(ip string) error {
     if err := f.ensureInitialized(); err != nil {
         return fmt.Errorf("failed to initialize firewall: %v", err)
     }
+
+    // LOCK HERE: Prevent multiple goroutines from flooding netlink at the same time
+    f.mu.Lock()
+    defer f.mu.Unlock()
 
     table := &nftables.Table{Family: nftables.TableFamilyINet, Name: "tblocker"}
     var set *nftables.Set
@@ -223,6 +230,10 @@ func (f *NFTFirewall) GetBlockedIPs() (map[string]bool, error) {
         return nil, err
     }
 
+    // LOCK HERE
+    f.mu.Lock()
+    defer f.mu.Unlock()
+
     table := &nftables.Table{Family: nftables.TableFamilyINet, Name: "tblocker"}
 
     sets, err := f.conn.GetSets(table)
@@ -232,7 +243,6 @@ func (f *NFTFirewall) GetBlockedIPs() (map[string]bool, error) {
 
     blockedIPs := make(map[string]bool)
     for _, s := range sets {
-        // Read both IPv4 and IPv6 sets
         if s.Name == setV4Name || s.Name == setV6Name {
             elements, err := f.conn.GetSetElements(s)
             if err != nil {

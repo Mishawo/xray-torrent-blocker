@@ -151,6 +151,10 @@ func (f *IPTablesFirewall) BlockIP(ip string) error {
         return err
     }
 
+    // LOCK: Prevent race conditions when reading/writing rules
+    f.mu.Lock()
+    defer f.mu.Unlock()
+
     rules, err := ipt.List("raw", f.chainName)
     if err != nil {
         return err
@@ -179,6 +183,10 @@ func (f *IPTablesFirewall) UnblockIP(ip string) error {
         return err
     }
 
+    // LOCK: Prevent race conditions when deleting rules
+    f.mu.Lock()
+    defer f.mu.Unlock()
+
     err = ipt.Delete("raw", f.chainName, "-s", ip, "-j", "DROP")
     if err != nil {
         log.Printf("Error unblocking IP %s from chain %s: %v", ip, f.chainName, err)
@@ -193,6 +201,10 @@ func (f *IPTablesFirewall) GetBlockedIPs() (map[string]bool, error) {
     if err := f.ensureInitialized(); err != nil {
         return nil, err
     }
+
+    // LOCK: Prevent race conditions while listing rules
+    f.mu.Lock()
+    defer f.mu.Unlock()
 
     blockedIPs := make(map[string]bool)
 

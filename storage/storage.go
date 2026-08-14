@@ -47,17 +47,30 @@ func NewIPStorage(storageDir string, unblockFunc func(ip string, delay time.Dura
 
 func (s *IPStorage) initializeUnblocks() {
     now := time.Now()
+
+    // Collect IPs to schedule first to avoid a recursive lock deadlock
+    type scheduleItem struct {
+        ip       string
+        delay    time.Duration
+        username string
+    }
+    var items []scheduleItem
+
     s.mu.RLock()
     for ip, info := range s.ips {
         if now.Before(info.BlockedUntil) {
-            delay := info.BlockedUntil.Sub(now)
-            s.scheduleUnblock(ip, delay, info.Username)
+            items = append(items, scheduleItem{ip, info.BlockedUntil.Sub(now), info.Username})
         } else {
             // Already expired before we restarted
-            s.scheduleUnblock(ip, 0, info.Username)
+            items = append(items, scheduleItem{ip, 0, info.Username})
         }
     }
     s.mu.RUnlock()
+
+    // Now schedule them safely (the read lock is released)
+    for _, item := range items {
+        s.scheduleUnblock(item.ip, item.delay, item.username)
+    }
 }
 
 // scheduleUnblock ensures we only ever schedule the unblock goroutine once per IP
@@ -72,7 +85,7 @@ func (s *IPStorage) scheduleUnblock(ip string, delay time.Duration, username str
 
     go func() {
         s.onUnblock(ip, delay, username)
-        
+
         // Once the unblock logic is finished, remove it from the scheduled map
         s.mu.Lock()
         delete(s.scheduled, ip)
@@ -141,7 +154,7 @@ func (s *IPStorage) IsBlocked(ip string) bool {
     // IMMEDIATE CLEANUP: If it's expired, remove it right now instead of returning false
     if time.Now().After(blocked.BlockedUntil) {
         s.mu.RUnlock()
-        s.RemoveBlockedIP(ip) 
+        s.RemoveBlockedIP(ip)
         return false
     }
 

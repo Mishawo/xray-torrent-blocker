@@ -216,14 +216,14 @@ func (f *NFTFirewall) UnblockIP(ip string) error {
     element := nftables.SetElement{Key: keyBytes}
     f.conn.SetDeleteElements(set, []nftables.SetElement{element})
 
-    if err := f.conn.Flush(); err != nil {
+        if err := f.conn.Flush(); err != nil {
+        // If the IP is not in the set, nftables returns "no such file or directory". We ignore it.
+        if strings.Contains(err.Error(), "no such file or directory") {
+            return nil
+        }
         log.Printf("Error unblocking IP %s with nftables: %v", ip, err)
         return fmt.Errorf("failed to unblock IP %s with nftables: %v", ip, err)
     }
-
-    log.Printf("IP %s unblocked with nftables", ip)
-    return nil
-}
 
 func (f *NFTFirewall) GetBlockedIPs() (map[string]bool, error) {
     if err := f.ensureInitialized(); err != nil {

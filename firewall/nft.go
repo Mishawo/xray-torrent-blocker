@@ -225,6 +225,10 @@ func (f *NFTFirewall) UnblockIP(ip string) error {
         return fmt.Errorf("failed to unblock IP %s with nftables: %v", ip, err)
     }
 
+    log.Printf("IP %s unblocked with nftables", ip)
+    return nil
+}
+
 func (f *NFTFirewall) GetBlockedIPs() (map[string]bool, error) {
     if err := f.ensureInitialized(); err != nil {
         return nil, err

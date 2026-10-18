@@ -1,11 +1,7 @@
 package utils
 
 import (
-    "bytes"
-    "encoding/json"
     "fmt"
-    "html"
-    "io"
     "log"
     "net"
     "net/http"
@@ -16,14 +12,17 @@ import (
     "tblocker/firewall"
     "tblocker/storage"
     "time"
+    "unsafe"
 
     "github.com/nxadm/tail"
 )
 
 var ipStorage *storage.IPStorage
 var firewallManager *firewall.Manager
-var tailer *tail.Tail // Added for graceful shutdown
-var shutdownChan = make(chan struct{})
+
+// webhookHTTPClient is shared across webhook calls so connections get reused
+// and a slow webhook endpoint can never hang a goroutine forever.
+var webhookHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 var (
     parseStats struct {
@@ -56,8 +55,7 @@ func initializeByteSearchPatterns() {
 }
 
 func StartLogMonitor() {
-    var err error
-    tailer, err = tail.TailFile(config.LogFile, tail.Config{
+    t, err := tail.TailFile(config.LogFile, tail.Config{
         Follow:    true,
         ReOpen:    true,
         Location:  &tail.SeekInfo{Offset: 0, Whence: 2},
@@ -67,61 +65,39 @@ func StartLogMonitor() {
         log.Fatalf("Error opening log file: %v", err)
     }
 
-    for {
-        select {
-        case line, ok := <-tailer.Lines:
-            if !ok {
-                return
-            }
-            // Safe conversion: no more unsafe.Pointer
-            lineBytes := []byte(line.Text)
-            hasTorrentTag := bytes.Contains(lineBytes, torrentTagBytes)
+    for line := range t.Lines {
+        lineBytes := stringToBytes(line.Text)
 
-            if config.EnablePerformanceMetrics {
-                parseStart := time.Now()
-                parseDuration := time.Since(parseStart)
-                updateParseStats(parseDuration, hasTorrentTag)
-            }
+        hasTorrentTag := containsBytes(lineBytes, torrentTagBytes)
 
-            if hasTorrentTag {
-                handleLogEntry(line.Text)
-            }
-        case <-shutdownChan:
-            log.Println("Log monitor stopping...")
-            return
+        if config.EnablePerformanceMetrics {
+            parseStart := time.Now()
+            parseDuration := time.Since(parseStart)
+
+            updateParseStats(parseDuration, hasTorrentTag)
+        }
+
+        if hasTorrentTag {
+            handleLogEntry(line.Text)
         }
     }
 }
 
-// Shutdown gracefully stops the log monitor and closes connections
-func Shutdown() {
-    log.Println("Shutting down components...")
-    close(shutdownChan)
-    if tailer != nil {
-        tailer.Stop()
-    }
-    if conntrackManager != nil {
-        conntrackManager.Close()
-    }
-    log.Println("Shutdown complete.")
-}
+func parseLogEntryFast(line string) (ip, username string, valid bool) {
+    lineBytes := stringToBytes(line)
 
-// Updated to return ip, port, username, valid
-func parseLogEntryFast(line string) (ip, port, username string, valid bool) {
-    lineBytes := []byte(line)
-
-    if !bytes.Contains(lineBytes, torrentTagBytes) {
-        return "", "", "", false
+    if !containsBytes(lineBytes, torrentTagBytes) {
+        return "", "", false
     }
 
-    fromIndex := bytes.Index(lineBytes, fromBytes)
+    fromIndex := indexBytes(lineBytes, fromBytes)
     if fromIndex == -1 {
-        return "", "", "", false
+        return "", "", false
     }
 
     ipStart := fromIndex + len(fromBytes)
     if ipStart >= len(line) {
-        return "", "", "", false
+        return "", "", false
     }
 
     if ipStart+4 < len(line) {
@@ -132,49 +108,51 @@ func parseLogEntryFast(line string) (ip, port, username string, valid bool) {
     }
 
     if ipStart >= len(line) {
-        return "", "", "", false
+        return "", "", false
     }
 
-    ipEnd := ipStart
-    for ipEnd < len(line) && line[ipEnd] != ':' {
-        ipEnd++
-    }
-
-    if ipEnd <= ipStart {
-        return "", "", "", false
-    }
-
-    ip = line[ipStart:ipEnd]
-
-    // Extract destination port (the torrent port)
-    if ipEnd < len(line) && line[ipEnd] == ':' {
-        portStart := ipEnd + 1
-        portEnd := portStart
-        for portEnd < len(line) && line[portEnd] != ' ' && line[portEnd] != '\t' && line[portEnd] != '\n' {
-            portEnd++
+    if line[ipStart] == '[' {
+        // IPv6 addresses are logged in bracketed form: [2001:db8::1]:443
+        bracketEnd := -1
+        for j := ipStart + 1; j < len(line) && line[j] != ' '; j++ {
+            if line[j] == ']' {
+                bracketEnd = j
+                break
+            }
         }
-        if portEnd > portStart {
-            port = line[portStart:portEnd]
+        if bracketEnd == -1 {
+            return "", "", false
         }
+        ip = line[ipStart+1 : bracketEnd]
+    } else {
+        ipEnd := ipStart
+        for ipEnd < len(line) && line[ipEnd] != ':' && line[ipEnd] != ' ' {
+            ipEnd++
+        }
+
+        if ipEnd <= ipStart {
+            return "", "", false
+        }
+
+        ip = line[ipStart:ipEnd]
     }
 
-    if !isValidIPFormat(ip) {
-        return "", "", "", false
+    // Validate and canonicalize the address (supports IPv4 and IPv6, e.g.
+    // 2001:DB8::1 becomes 2001:db8::1 and ::ffff:1.2.3.4 becomes 1.2.3.4)
+    parsedIP := net.ParseIP(ip)
+    if parsedIP == nil {
+        return "", "", false
     }
+    ip = parsedIP.String()
 
-    // Handle IgnoreEmail setting (TPROXY support)
-    if config.IgnoreEmail {
-        return ip, port, "unknown", true
-    }
-
-    emailIndex := bytes.Index(lineBytes, emailBytes)
+    emailIndex := indexBytes(lineBytes, emailBytes)
     if emailIndex == -1 {
-        return "", "", "", false
+        return "", "", false
     }
 
     userStart := emailIndex + len(emailBytes)
     if userStart >= len(line) {
-        return "", "", "", false
+        return "", "", false
     }
 
     userEnd := userStart
@@ -183,15 +161,15 @@ func parseLogEntryFast(line string) (ip, port, username string, valid bool) {
     }
 
     if userEnd <= userStart {
-        return "", "", "", false
+        return "", "", false
     }
 
     username = line[userStart:userEnd]
-    return ip, port, username, true
+    return ip, username, true
 }
 
 func handleLogEntry(line string) {
-    ip, port, usernameStr, valid := parseLogEntryFast(line)
+    ip, usernameStr, valid := parseLogEntryFast(line)
 
     if !valid {
         log.Println("Invalid log entry format: IP or username missing")
@@ -212,10 +190,7 @@ func handleLogEntry(line string) {
     }
 
     go BlockIP(ip)
-    log.Printf("User %s with IP: %s:%s blocked for %d minutes\n", usernameStr, ip, port, config.BlockDuration)
-
-    // Phase 4: Record strike for repeat offender tracking
-    RecordStrike(usernameStr, port)
+    log.Printf("User %s with IP: %s blocked for %d minutes\n", usernameStr, ip, config.BlockDuration)
 
     if config.SendWebhook {
         go SendWebhook(usernameStr, ip, "block")
@@ -261,15 +236,18 @@ func UpdateBlockedIPs() {
         return
     }
 
+    currentBlockedIPs, err := firewallManager.GetBlockedIPs()
+    if err != nil {
+        log.Printf("Error checking firewall status: %v", err)
+        return
+    }
+
     blockedInStorage := ipStorage.GetBlockedIPs()
 
     for ip, info := range blockedInStorage {
-        if time.Now().Before(info.BlockedUntil) {
+        if time.Now().Before(info.BlockedUntil) && !currentBlockedIPs[ip] {
             log.Printf("Restoring block for IP: %s (user: %s) using %s", ip, info.Username, firewallManager.GetFirewallName())
             go BlockIP(ip)
-        } else {
-            // Clean up expired blocks from storage on startup
-            ipStorage.RemoveBlockedIP(ip)
         }
     }
 }
@@ -286,12 +264,22 @@ func ScheduleBlockedIPsUpdate() {
 func UnblockIPAfterDelay(ip string, delay time.Duration, username string) {
     time.Sleep(delay)
 
+    if ipStorage.IsBlocked(ip) {
+        log.Printf("Skipping unblock for IP %s as it has an active block", ip)
+        return
+    }
+
     if firewallManager == nil {
         log.Printf("Firewall manager not initialized")
         return
     }
 
-    // Attempt to unblock from firewall directly
+    blockedIPs := ipStorage.GetBlockedIPs()
+    if _, exists := blockedIPs[ip]; !exists {
+        log.Printf("IP %s not found in storage, skipping unblock", ip)
+        return
+    }
+
     err := firewallManager.UnblockIP(ip)
     if err != nil {
         if strings.Contains(err.Error(), "no rule found") || strings.Contains(err.Error(), "exit status 1") {
@@ -302,9 +290,8 @@ func UnblockIPAfterDelay(ip string, delay time.Duration, username string) {
         }
     }
 
-    // Clean up storage (it's okay if it was already cleaned up)
     if err := ipStorage.RemoveBlockedIP(ip); err != nil {
-        // Ignore error if it doesn't exist
+        log.Printf("Error removing IP from storage: %v", err)
     }
 
     log.Printf("User %s with IP: %s has been unblocked\n", username, ip)
@@ -319,19 +306,63 @@ func IsBypassedIP(ip string) bool {
     return exists
 }
 
-// Updated to use net.ParseIP for native IPv4 and IPv6 support
-func isValidIPFormat(ip string) bool {
-    return net.ParseIP(ip) != nil
+func containsBytes(haystack, needle []byte) bool {
+    if len(needle) == 0 {
+        return true
+    }
+    if len(needle) > len(haystack) {
+        return false
+    }
+
+    first := needle[0]
+    for i := 0; i <= len(haystack)-len(needle); i++ {
+        if haystack[i] == first {
+            match := true
+            for j := 1; j < len(needle); j++ {
+                if haystack[i+j] != needle[j] {
+                    match = false
+                    break
+                }
+            }
+            if match {
+                return true
+            }
+        }
+    }
+    return false
 }
 
-// WebhookPayload defines the structure for safe JSON encoding (fallback)
-type WebhookPayload struct {
-    Username  string `json:"username"`
-    IP        string `json:"ip"`
-    Server    string `json:"server"`
-    Action    string `json:"action"`
-    Duration  int    `json:"duration"`
-    Timestamp string `json:"timestamp"`
+func indexBytes(haystack, needle []byte) int {
+    if len(needle) == 0 {
+        return 0
+    }
+    if len(needle) > len(haystack) {
+        return -1
+    }
+
+    first := needle[0]
+    for i := 0; i <= len(haystack)-len(needle); i++ {
+        if haystack[i] == first {
+            match := true
+            for j := 1; j < len(needle); j++ {
+                if haystack[i+j] != needle[j] {
+                    match = false
+                    break
+                }
+            }
+            if match {
+                return i
+            }
+        }
+    }
+    return -1
+}
+
+func stringToBytes(s string) []byte {
+    return *(*[]byte)(unsafe.Pointer(&struct {
+        string
+        int
+    }{s, len(s)}))
 }
 
 func SendWebhook(username string, ip string, action string) {
@@ -341,44 +372,17 @@ func SendWebhook(username string, ip string, action string) {
 
     cleanUsername := processUsernameForWebhook(username)
 
-    // Escape HTML characters to prevent Telegram API 400 errors when parse_mode is HTML
-    // This turns characters like <, >, " into &lt;, &gt;, &quot;
-    escapedUsername := html.EscapeString(cleanUsername)
-    escapedIP := html.EscapeString(ip)
-    escapedServer := html.EscapeString(config.Hostname)
+    payload := fmt.Sprintf(
+        config.WebhookTemplate,
+        cleanUsername,
+        ip,
+        config.Hostname,
+        action,
+        config.BlockDuration,
+        time.Now().Format(time.RFC3339),
+    )
 
-    var payloadStr string
-
-    // If a custom template is provided in config.yaml (like your inject_config.sh does), use it.
-    if config.WebhookTemplate != "" {
-        payloadStr = fmt.Sprintf(
-            config.WebhookTemplate,
-            escapedUsername,
-            escapedIP,
-            escapedServer,
-            action,
-            config.BlockDuration,
-            time.Now().Format(time.RFC3339),
-        )
-    } else {
-        // Fallback to safe JSON struct if no template is provided
-        payload := WebhookPayload{
-            Username:  escapedUsername,
-            IP:        escapedIP,
-            Server:    escapedServer,
-            Action:    action,
-            Duration:  config.BlockDuration,
-            Timestamp: time.Now().Format(time.RFC3339),
-        }
-        payloadBytes, err := json.Marshal(payload)
-        if err != nil {
-            log.Printf("Error marshaling webhook payload: %v", err)
-            return
-        }
-        payloadStr = string(payloadBytes)
-    }
-
-    req, err := http.NewRequest("POST", config.WebhookURL, bytes.NewReader([]byte(payloadStr)))
+    req, err := http.NewRequest("POST", config.WebhookURL, strings.NewReader(payload))
     if err != nil {
         log.Printf("Error creating webhook request: %v", err)
         return
@@ -389,7 +393,7 @@ func SendWebhook(username string, ip string, action string) {
         req.Header.Set(key, value)
     }
 
-    client := &http.Client{}
+    client := webhookHTTPClient
     resp, err := client.Do(req)
     if err != nil {
         log.Printf("Error sending webhook: %v", err)
@@ -398,8 +402,7 @@ func SendWebhook(username string, ip string, action string) {
     defer resp.Body.Close()
 
     if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-        body, _ := io.ReadAll(resp.Body)
-        log.Printf("Webhook returned unexpected status code: %d. Error: %s", resp.StatusCode, string(body))
+        log.Printf("Webhook returned unexpected status code: %d", resp.StatusCode)
     }
 }
 

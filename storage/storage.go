@@ -18,7 +18,6 @@ type IPStorage struct {
     filepath  string
     mu        sync.RWMutex
     ips       map[string]BlockedIP
-    scheduled map[string]bool // Added to track scheduled unblocks and prevent duplicates
     onUnblock func(ip string, delay time.Duration, username string)
 }
 
@@ -30,7 +29,6 @@ func NewIPStorage(storageDir string, unblockFunc func(ip string, delay time.Dura
     storage := &IPStorage{
         filepath:  filepath.Join(storageDir, "blocked_ips.json"),
         ips:       make(map[string]BlockedIP),
-        scheduled: make(map[string]bool),
         onUnblock: unblockFunc,
     }
 
@@ -47,50 +45,16 @@ func NewIPStorage(storageDir string, unblockFunc func(ip string, delay time.Dura
 
 func (s *IPStorage) initializeUnblocks() {
     now := time.Now()
-
-    // Collect IPs to schedule first to avoid a recursive lock deadlock
-    type scheduleItem struct {
-        ip       string
-        delay    time.Duration
-        username string
-    }
-    var items []scheduleItem
-
     s.mu.RLock()
     for ip, info := range s.ips {
         if now.Before(info.BlockedUntil) {
-            items = append(items, scheduleItem{ip, info.BlockedUntil.Sub(now), info.Username})
+            delay := info.BlockedUntil.Sub(now)
+            go s.onUnblock(ip, delay, info.Username)
         } else {
-            // Already expired before we restarted
-            items = append(items, scheduleItem{ip, 0, info.Username})
+            go s.onUnblock(ip, 0, info.Username)
         }
     }
     s.mu.RUnlock()
-
-    // Now schedule them safely (the read lock is released)
-    for _, item := range items {
-        s.scheduleUnblock(item.ip, item.delay, item.username)
-    }
-}
-
-// scheduleUnblock ensures we only ever schedule the unblock goroutine once per IP
-func (s *IPStorage) scheduleUnblock(ip string, delay time.Duration, username string) {
-    s.mu.Lock()
-    if s.scheduled[ip] {
-        s.mu.Unlock()
-        return // Already scheduled, do nothing
-    }
-    s.scheduled[ip] = true
-    s.mu.Unlock()
-
-    go func() {
-        s.onUnblock(ip, delay, username)
-
-        // Once the unblock logic is finished, remove it from the scheduled map
-        s.mu.Lock()
-        delete(s.scheduled, ip)
-        s.mu.Unlock()
-    }()
 }
 
 func (s *IPStorage) load() error {
@@ -106,16 +70,47 @@ func (s *IPStorage) load() error {
 }
 
 func (s *IPStorage) save() error {
-    s.mu.RLock()
-    data, err := json.MarshalIndent(s.ips, "", "  ")
-    s.mu.RUnlock()
+    // Hold the write lock for the whole commit so saves can never land
+    // out-of-order (an older snapshot overwriting a newer one).
+    s.mu.Lock()
+    defer s.mu.Unlock()
 
+    data, err := json.MarshalIndent(s.ips, "", "  ")
     if err != nil {
         return err
     }
 
-    // Changed permissions to 0600 for better security (contains usernames/IPs)
-    return os.WriteFile(s.filepath, data, 0600)
+    // Write to a unique temporary file first, then atomically rename it over
+    // the real file so a crash mid-write can never corrupt blocked_ips.json
+    tmpFile, err := os.CreateTemp(filepath.Dir(s.filepath), filepath.Base(s.filepath)+".tmp-")
+    if err != nil {
+        return err
+    }
+    tmpPath := tmpFile.Name()
+
+    if _, err := tmpFile.Write(data); err != nil {
+        tmpFile.Close()
+        os.Remove(tmpPath)
+        return err
+    }
+
+    if err := tmpFile.Chmod(0644); err != nil {
+        tmpFile.Close()
+        os.Remove(tmpPath)
+        return err
+    }
+
+    if err := tmpFile.Close(); err != nil {
+        os.Remove(tmpPath)
+        return err
+    }
+
+    if err := os.Rename(tmpPath, s.filepath); err != nil {
+        os.Remove(tmpPath)
+        return err
+    }
+
+    return nil
 }
 
 func (s *IPStorage) AddBlockedIP(ip, username string, duration time.Duration) error {
@@ -129,7 +124,7 @@ func (s *IPStorage) AddBlockedIP(ip, username string, duration time.Duration) er
     }
     s.mu.Unlock()
 
-    s.scheduleUnblock(ip, duration, username)
+    go s.onUnblock(ip, duration, username)
 
     return s.save()
 }
@@ -137,7 +132,6 @@ func (s *IPStorage) AddBlockedIP(ip, username string, duration time.Duration) er
 func (s *IPStorage) RemoveBlockedIP(ip string) error {
     s.mu.Lock()
     delete(s.ips, ip)
-    delete(s.scheduled, ip) // Clean up scheduled map just in case
     s.mu.Unlock()
 
     return s.save()
@@ -145,20 +139,17 @@ func (s *IPStorage) RemoveBlockedIP(ip string) error {
 
 func (s *IPStorage) IsBlocked(ip string) bool {
     s.mu.RLock()
+    defer s.mu.RUnlock()
+
     blocked, exists := s.ips[ip]
     if !exists {
-        s.mu.RUnlock()
         return false
     }
 
-    // IMMEDIATE CLEANUP: If it's expired, remove it right now instead of returning false
     if time.Now().After(blocked.BlockedUntil) {
-        s.mu.RUnlock()
-        s.RemoveBlockedIP(ip)
         return false
     }
 
-    s.mu.RUnlock()
     return true
 }
 
@@ -175,8 +166,7 @@ func (s *IPStorage) GetBlockedIPs() map[string]BlockedIP {
 }
 
 func (s *IPStorage) cleanupRoutine() {
-    // Reduced from 5 minutes to 1 minute for better accuracy
-    ticker := time.NewTicker(1 * time.Minute)
+    ticker := time.NewTicker(5 * time.Minute)
     defer ticker.Stop()
 
     for range ticker.C {
@@ -197,9 +187,8 @@ func (s *IPStorage) cleanupRoutine() {
         }
         s.mu.RUnlock()
 
-        // Use the safe scheduling method
         for _, item := range ipsToCheck {
-            s.scheduleUnblock(item.ip, 0, item.username)
+            go s.onUnblock(item.ip, 0, item.username)
         }
     }
 }

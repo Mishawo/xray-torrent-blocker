@@ -1,23 +1,23 @@
 package firewall
 
 import (
+    "bytes"
     "fmt"
     "log"
     "net"
-    "strings"
-    "sync"
 
     "github.com/google/nftables"
     "github.com/google/nftables/expr"
 )
 
 const (
-    setV4Name = "TBLOCKER_IPV4"
-    setV6Name = "TBLOCKER_IPV6"
+    nftTableName   = "tblocker"
+    nftChainName   = "TBLOCKER_BLOCKED"
+    nftSetNameIPv4 = "TBLOCKER_BLOCKED_IPS"
+    nftSetNameIPv6 = "TBLOCKER_BLOCKED_IPS6"
 )
 
 type NFTFirewall struct {
-    mu          sync.Mutex
     conn        *nftables.Conn
     initialized bool
 }
@@ -38,13 +38,13 @@ func (f *NFTFirewall) Initialize() error {
 
     table := &nftables.Table{
         Family: nftables.TableFamilyINet,
-        Name:   "tblocker",
+        Name:   nftTableName,
     }
     f.conn.AddTable(table)
 
     policy := nftables.ChainPolicyAccept
     chain := &nftables.Chain{
-        Name:     "TBLOCKER_BLOCKED",
+        Name:     nftChainName,
         Table:    table,
         Type:     nftables.ChainTypeFilter,
         Hooknum:  nftables.ChainHookPrerouting,
@@ -53,48 +53,72 @@ func (f *NFTFirewall) Initialize() error {
     }
     f.conn.AddChain(chain)
 
-    // Create IPv4 Set
-    setV4 := &nftables.Set{
+    set4 := &nftables.Set{
         Table:   table,
-        Name:    setV4Name,
+        Name:    nftSetNameIPv4,
         KeyType: nftables.TypeIPAddr,
     }
-    f.conn.AddSet(setV4, []nftables.SetElement{})
+    f.conn.AddSet(set4, []nftables.SetElement{})
 
-    // Create IPv6 Set
-    setV6 := &nftables.Set{
+    set6 := &nftables.Set{
         Table:   table,
-        Name:    setV6Name,
+        Name:    nftSetNameIPv6,
         KeyType: nftables.TypeIP6Addr,
     }
-    f.conn.AddSet(setV6, []nftables.SetElement{})
+    f.conn.AddSet(set6, []nftables.SetElement{})
 
-    // Add IPv4 Rule (Offset 12, Len 4)
-    if !f.ruleExists(table, chain, setV4Name, 12, 4) {
-        ruleV4 := &nftables.Rule{
+    // IPv4 source address drop rule (network header offset 12, 4 bytes)
+    if !f.dropRuleExists(table, chain, nftSetNameIPv4, 12, 4) {
+        f.conn.AddRule(&nftables.Rule{
             Table: table,
             Chain: chain,
             Exprs: []expr.Any{
-                &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
-                &expr.Lookup{SourceRegister: 1, SetName: setV4.Name, SetID: setV4.ID},
-                &expr.Verdict{Kind: expr.VerdictDrop},
+                &expr.Payload{
+                    DestRegister: 1,
+                    Base:         expr.PayloadBaseNetworkHeader,
+                    Offset:       12,
+                    Len:          4,
+                },
+                &expr.Lookup{
+                    SourceRegister: 1,
+                    SetName:        nftSetNameIPv4,
+                    SetID:          set4.ID,
+                },
+                &expr.Verdict{
+                    Kind: expr.VerdictDrop,
+                },
             },
-        }
-        f.conn.AddRule(ruleV4)
+        })
+        log.Printf("IPv4 drop rule added to nftables")
+    } else {
+        log.Printf("IPv4 drop rule already exists in nftables")
     }
 
-    // Add IPv6 Rule (Offset 8, Len 16)
-    if !f.ruleExists(table, chain, setV6Name, 8, 16) {
-        ruleV6 := &nftables.Rule{
+    // IPv6 source address drop rule (network header offset 8, 16 bytes)
+    if !f.dropRuleExists(table, chain, nftSetNameIPv6, 8, 16) {
+        f.conn.AddRule(&nftables.Rule{
             Table: table,
             Chain: chain,
             Exprs: []expr.Any{
-                &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16},
-                &expr.Lookup{SourceRegister: 1, SetName: setV6.Name, SetID: setV6.ID},
-                &expr.Verdict{Kind: expr.VerdictDrop},
+                &expr.Payload{
+                    DestRegister: 1,
+                    Base:         expr.PayloadBaseNetworkHeader,
+                    Offset:       8,
+                    Len:          16,
+                },
+                &expr.Lookup{
+                    SourceRegister: 1,
+                    SetName:        nftSetNameIPv6,
+                    SetID:          set6.ID,
+                },
+                &expr.Verdict{
+                    Kind: expr.VerdictDrop,
+                },
             },
-        }
-        f.conn.AddRule(ruleV6)
+        })
+        log.Printf("IPv6 drop rule added to nftables")
+    } else {
+        log.Printf("IPv6 drop rule already exists in nftables")
     }
 
     err := f.conn.Flush()
@@ -108,42 +132,59 @@ func (f *NFTFirewall) Initialize() error {
     return nil
 }
 
-// ruleExists checks if a rule for a specific set and IP protocol exists
-func (f *NFTFirewall) ruleExists(table *nftables.Table, chain *nftables.Chain, setName string, offset, length uint32) bool {
+// dropRuleExists checks whether a payload -> lookup -> verdict(DROP) rule for
+// the given set and source-address offset already exists in the chain.
+func (f *NFTFirewall) dropRuleExists(table *nftables.Table, chain *nftables.Chain, setName string, payloadOffset, payloadLen uint32) bool {
     rules, err := f.conn.GetRules(table, chain)
     if err != nil {
+        log.Printf("Error checking existing nftables rules: %v", err)
         return false
     }
 
     for _, rule := range rules {
-        if len(rule.Exprs) >= 3 {
-            if payload, ok := rule.Exprs[0].(*expr.Payload); ok {
-                if payload.DestRegister == 1 && payload.Base == expr.PayloadBaseNetworkHeader &&
-                    payload.Offset == offset && payload.Len == length {
-                    if lookup, ok := rule.Exprs[1].(*expr.Lookup); ok {
-                        if lookup.SourceRegister == 1 && lookup.SetName == setName {
-                            if verdict, ok := rule.Exprs[2].(*expr.Verdict); ok {
-                                if verdict.Kind == expr.VerdictDrop {
-                                    return true
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if len(rule.Exprs) < 3 {
+            continue
+        }
+
+        payload, okPayload := rule.Exprs[0].(*expr.Payload)
+        lookup, okLookup := rule.Exprs[1].(*expr.Lookup)
+        verdict, okVerdict := rule.Exprs[2].(*expr.Verdict)
+
+        if okPayload && okLookup && okVerdict &&
+            payload.DestRegister == 1 &&
+            payload.Base == expr.PayloadBaseNetworkHeader &&
+            payload.Offset == payloadOffset &&
+            payload.Len == payloadLen &&
+            lookup.SourceRegister == 1 &&
+            lookup.SetName == setName &&
+            verdict.Kind == expr.VerdictDrop {
+            return true
         }
     }
     return false
 }
 
-// ensureInitialized safely handles the mutex locking for initialization
-func (f *NFTFirewall) ensureInitialized() error {
-    f.mu.Lock()
-    defer f.mu.Unlock()
-    if !f.initialized {
-        return f.Initialize()
+// setForIP returns the nftables set (and the element key) matching the IP
+// family of the given address.
+func setForIP(ip net.IP) (*nftables.Set, []byte) {
+    table := &nftables.Table{
+        Family: nftables.TableFamilyINet,
+        Name:   nftTableName,
     }
-    return nil
+
+    if ip.To4() != nil {
+        return &nftables.Set{
+            Table:   table,
+            Name:    nftSetNameIPv4,
+            KeyType: nftables.TypeIPAddr,
+        }, ip.To4()
+    }
+
+    return &nftables.Set{
+        Table:   table,
+        Name:    nftSetNameIPv6,
+        KeyType: nftables.TypeIP6Addr,
+    }, ip.To16()
 }
 
 func (f *NFTFirewall) BlockIP(ip string) error {
@@ -152,33 +193,16 @@ func (f *NFTFirewall) BlockIP(ip string) error {
         return fmt.Errorf("invalid IP address: %s", ip)
     }
 
-    if err := f.ensureInitialized(); err != nil {
-        return fmt.Errorf("failed to initialize firewall: %v", err)
+    if !f.initialized {
+        if err := f.Initialize(); err != nil {
+            return fmt.Errorf("failed to initialize firewall: %v", err)
+        }
     }
 
-    // LOCK HERE: Prevent multiple goroutines from flooding netlink at the same time
-    f.mu.Lock()
-    defer f.mu.Unlock()
-
-    table := &nftables.Table{Family: nftables.TableFamilyINet, Name: "tblocker"}
-    var set *nftables.Set
-    var keyBytes []byte
-
-    if v4 := parsedIP.To4(); v4 != nil {
-        set = &nftables.Set{Table: table, Name: setV4Name, KeyType: nftables.TypeIPAddr}
-        keyBytes = v4
-    } else {
-        set = &nftables.Set{Table: table, Name: setV6Name, KeyType: nftables.TypeIP6Addr}
-        keyBytes = parsedIP.To16()
-    }
-
-    element := nftables.SetElement{Key: keyBytes}
-    f.conn.SetAddElements(set, []nftables.SetElement{element})
+    set, key := setForIP(parsedIP)
+    f.conn.SetAddElements(set, []nftables.SetElement{{Key: key}})
 
     if err := f.conn.Flush(); err != nil {
-        if strings.Contains(err.Error(), "exists") {
-            return nil
-        }
         log.Printf("Error adding IP %s to nftables set: %v", ip, err)
         return fmt.Errorf("failed to add IP %s to nftables set: %v", ip, err)
     }
@@ -193,34 +217,18 @@ func (f *NFTFirewall) UnblockIP(ip string) error {
         return fmt.Errorf("invalid IP address: %s", ip)
     }
 
-    if err := f.ensureInitialized(); err != nil {
-        return fmt.Errorf("failed to initialize firewall: %v", err)
-    }
+    set, key := setForIP(parsedIP)
 
-    // LOCK HERE: Prevent multiple goroutines from flooding netlink at the same time
-    f.mu.Lock()
-    defer f.mu.Unlock()
+    f.conn.SetDeleteElements(set, []nftables.SetElement{{Key: key}})
 
-    table := &nftables.Table{Family: nftables.TableFamilyINet, Name: "tblocker"}
-    var set *nftables.Set
-    var keyBytes []byte
-
-    if v4 := parsedIP.To4(); v4 != nil {
-        set = &nftables.Set{Table: table, Name: setV4Name, KeyType: nftables.TypeIPAddr}
-        keyBytes = v4
-    } else {
-        set = &nftables.Set{Table: table, Name: setV6Name, KeyType: nftables.TypeIP6Addr}
-        keyBytes = parsedIP.To16()
-    }
-
-    element := nftables.SetElement{Key: keyBytes}
-    f.conn.SetDeleteElements(set, []nftables.SetElement{element})
-
-        if err := f.conn.Flush(); err != nil {
-        // If the IP is not in the set, nftables returns "no such file or directory". We ignore it.
-        if strings.Contains(err.Error(), "no such file or directory") {
+    if err := f.conn.Flush(); err != nil {
+        // If the IP is no longer in the set, the unblock effectively already
+        // happened - treat it as success so storage cleanup can proceed.
+        if !f.isIPInSet(set.Name, key) {
+            log.Printf("IP %s already unblocked with nftables", ip)
             return nil
         }
+
         log.Printf("Error unblocking IP %s with nftables: %v", ip, err)
         return fmt.Errorf("failed to unblock IP %s with nftables: %v", ip, err)
     }
@@ -229,36 +237,68 @@ func (f *NFTFirewall) UnblockIP(ip string) error {
     return nil
 }
 
-func (f *NFTFirewall) GetBlockedIPs() (map[string]bool, error) {
-    if err := f.ensureInitialized(); err != nil {
-        return nil, err
+// isIPInSet reports whether key is currently present in the named set.
+func (f *NFTFirewall) isIPInSet(setName string, key []byte) bool {
+    table := &nftables.Table{
+        Family: nftables.TableFamilyINet,
+        Name:   nftTableName,
     }
-
-    // LOCK HERE
-    f.mu.Lock()
-    defer f.mu.Unlock()
-
-    table := &nftables.Table{Family: nftables.TableFamilyINet, Name: "tblocker"}
 
     sets, err := f.conn.GetSets(table)
     if err != nil {
+        log.Printf("Warning: could not verify nftables set contents: %v", err)
+        return false
+    }
+
+    for _, s := range sets {
+        if s.Name != setName {
+            continue
+        }
+
+        elements, err := f.conn.GetSetElements(s)
+        if err != nil {
+            log.Printf("Warning: could not list nftables set %s: %v", setName, err)
+            return false
+        }
+
+        for _, element := range elements {
+            if bytes.Equal(element.Key, key) {
+                return true
+            }
+        }
+        return false
+    }
+    return false
+}
+
+func (f *NFTFirewall) GetBlockedIPs() (map[string]bool, error) {
+    table := &nftables.Table{
+        Family: nftables.TableFamilyINet,
+        Name:   nftTableName,
+    }
+
+    sets, err := f.conn.GetSets(table)
+    if err != nil {
+        log.Printf("Error getting sets via API: %v", err)
         return nil, fmt.Errorf("failed to get sets via API: %v", err)
     }
 
     blockedIPs := make(map[string]bool)
     for _, s := range sets {
-        if s.Name == setV4Name || s.Name == setV6Name {
-            elements, err := f.conn.GetSetElements(s)
-            if err != nil {
-                log.Printf("Error listing nftables set %s via API: %v", s.Name, err)
-                continue
-            }
+        if s.Name != nftSetNameIPv4 && s.Name != nftSetNameIPv6 {
+            continue
+        }
 
-            for _, element := range elements {
-                if len(element.Key) > 0 {
-                    ip := net.IP(element.Key).String()
-                    blockedIPs[ip] = true
-                }
+        elements, err := f.conn.GetSetElements(s)
+        if err != nil {
+            log.Printf("Warning: could not list nftables set %s: %v", s.Name, err)
+            continue
+        }
+
+        for _, element := range elements {
+            switch len(element.Key) {
+            case 4, 16:
+                blockedIPs[net.IP(element.Key).String()] = true
             }
         }
     }

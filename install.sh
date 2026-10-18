@@ -168,61 +168,7 @@ fi
 
 print_info "Configuration setup..."
 echo ""
-
-# --- log file selection (old x-ui / new x-ui / custom path) ---
-choose_log_file() {
-    OLD_XUI_LOG="/usr/local/x-ui/access.log"
-    NEW_XUI_LOG="/var/log/x-ui/access.log"
-
-    print_info "Select the log file to monitor:"
-    echo "  1) $OLD_XUI_LOG   (old x-ui)"
-    echo "  2) $NEW_XUI_LOG   (new x-ui)"
-    echo "  3) Enter a custom path"
-
-    # auto-detect which path actually exists to suggest a default
-    default_choice=""
-    if [ -f "$OLD_XUI_LOG" ] && [ ! -f "$NEW_XUI_LOG" ]; then
-        default_choice=1
-    elif [ -f "$NEW_XUI_LOG" ] && [ ! -f "$OLD_XUI_LOG" ]; then
-        default_choice=2
-    fi
-    if [ -n "$default_choice" ]; then
-        print_info "Auto-detected existing log: option $default_choice (press Enter to use it)"
-    fi
-
-    while true; do
-        if [ -n "$default_choice" ]; then
-            read -p "Select log file [1-3, default=$default_choice]: " log_choice
-            log_choice=${log_choice:-$default_choice}
-        else
-            read -p "Select log file [1-3]: " log_choice
-        fi
-
-        case $log_choice in
-            1)
-                log_file_path="$OLD_XUI_LOG"
-                break
-                ;;
-            2)
-                log_file_path="$NEW_XUI_LOG"
-                break
-                ;;
-            3)
-                read -p "Enter the path to the log file to monitor: " log_file_path
-                if [ -z "$log_file_path" ]; then
-                    print_error "Path cannot be empty. Try again."
-                    continue
-                fi
-                break
-                ;;
-            *)
-                print_error "Invalid choice. Please select 1, 2 or 3."
-                ;;
-        esac
-    done
-}
-
-choose_log_file
+read -p "Enter the path to the log file to monitor: " log_file_path
 
 if [ ! -f "$log_file_path" ]; then
     print_warning "Log file does not exist: $log_file_path"
@@ -301,19 +247,6 @@ print_success "Configuration updated:"
 print_info "  Log file: $log_file_path"
 print_info "  Firewall: $FIREWALL"
 
-# --- install live log viewer (works with old & new x-ui paths) ---
-print_info "Installing live log viewer..."
-if curl -fsSL "https://raw.githubusercontent.com/Mishawo/xray-torrent-blocker/main/logs.sh" -o /opt/tblocker/logs.sh; then
-    chmod +x /opt/tblocker/logs.sh
-    ln -sf /opt/tblocker/logs.sh /usr/local/bin/tblocker-logs
-    print_success "Live log viewer installed. Run 'tblocker-logs' any time."
-else
-    print_warning "Could not download logs.sh (non-fatal). You can view logs manually with:"
-    print_info "  tail -f /usr/local/x-ui/access.log   (old x-ui)"
-    print_info "  tail -f /var/log/x-ui/access.log     (new x-ui)"
-    print_info "  journalctl -u tblocker -f"
-fi
-
 print_info "Starting tblocker service..."
 systemctl daemon-reload
 systemctl enable tblocker
@@ -348,14 +281,10 @@ echo "==============================================================="
 echo ""
 print_info "Configuration file: $CONFIG_PATH"
 print_info "Service status: systemctl status tblocker"
-print_info "Live logs (menu for old/new x-ui + service): tblocker-logs"
 print_info "Service logs: journalctl -u tblocker -f"
-print_info "x-ui access log (old): tail -f /usr/local/x-ui/access.log"
-print_info "x-ui access log (new): tail -f /var/log/x-ui/access.log"
 echo ""
 print_warning "IMPORTANT: Make sure your firewall ($FIREWALL) is properly configured!"
 echo ""
 print_info "For additional parameters (webhooks, whitelist, etc.):"
 print_info "HELLO BITCH"
 echo "==============================================================="
-
